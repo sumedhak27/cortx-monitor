@@ -21,6 +21,9 @@
 
 import errno
 import json
+import socket
+import time
+import uuid
 
 from framework.actuator_state_manager import actuator_state_manager
 from framework.base.module_thread import ScheduledModuleThread
@@ -32,6 +35,10 @@ from json_msgs.messages.sensors.service_watchdog import ServiceWatchdogMsg
 from json_msgs.messages.actuators.ack_response import AckResponseMsg
 # Modules that receive messages from this module
 from message_handlers.logging_msg_handler import LoggingMsgHandler
+# from cortx.utils.conf_store import Conf
+from framework.utils.conf_utils import (
+    CLUSTER, CLUSTER_ID, GLOBAL_CONF, NODE_ID, RACK_ID, SITE_ID, SRVNODE, Conf)
+from framework.utils.severity_reader import SeverityReader
 
 
 class ServiceMsgHandler(ScheduledModuleThread, InternalMsgQ):
@@ -209,8 +216,9 @@ class ServiceMsgHandler(ScheduledModuleThread, InternalMsgQ):
                 self._log_debug(f"_processMsg, service_name: {service_name}, state: {state}, substate: {substate}")
                 self._log_debug(f"_processMsg, prev state: {prev_state}, prev substate: {prev_substate}")
 
+            _internal_json_msg = self._gen_internal_msg(jsonMsg)
             # Create a service watchdog message and send it out
-            jsonMsg = ServiceWatchdogMsg(service_name, state, prev_state, substate, prev_substate, pid, prev_pid).getJson()
+            jsonMsg = ServiceWatchdogMsg(_internal_json_msg).getJson()
             self._write_internal_msgQ("RabbitMQegressProcessor", jsonMsg)
 
             # Create an IEM if the resulting service state is failed
@@ -240,6 +248,66 @@ class ServiceMsgHandler(ScheduledModuleThread, InternalMsgQ):
                     LoggingMsgHandler.name(), internal_json_msg)
 
         # ... handle other service message types
+
+    def _gen_internal_msg(self, jsonMsg):
+        """ Generate json message"""
+
+        alert_type = "fault"
+        severity_reader = SeverityReader()
+        severity = severity_reader.map_severity(alert_type)
+
+        epoch_time = str(int(time.time()))
+
+        alert_id = self._get_alert_id(epoch_time)
+        host_name = socket.gethostname()
+
+        self._site_id = Conf.get(GLOBAL_CONF, f"{CLUSTER}>{SRVNODE}>{SITE_ID}",'DC01')
+        self._rack_id = Conf.get(GLOBAL_CONF, f"{CLUSTER}>{SRVNODE}>{RACK_ID}",'RC01')
+        self._node_id = Conf.get(GLOBAL_CONF, f"{CLUSTER}>{SRVNODE}>{NODE_ID}",'SN01')
+        self._cluster_id = Conf.get(GLOBAL_CONF, f'{CLUSTER}>{CLUSTER_ID}','CC01')
+        self.RESOURCE_TYPE = "node:os:sercive_watchdog"
+
+        specific_info = jsonMsg.get("actuator_request_type").get("service_watchdog_controller")
+        service_name = specific_info.get("service_name")
+        description = "%s changed its state from %s:%s to %s:%s" % (
+                        service_name,
+                        specific_info.get("previous_state"),
+                        specific_info.get("previous_substate"),
+                        specific_info.get("state"),
+                        specific_info.get("substate"),
+                        )
+
+        info = {
+                "site_id": self._site_id,
+                "cluster_id": self._cluster_id,
+                "rack_id": self._rack_id,
+                "node_id": self._node_id,
+                "resource_type": self.RESOURCE_TYPE,
+                "resource_id": service_name,
+                "event_time": epoch_time,
+                "description" : description
+                }
+
+        json_msg = json.dumps(
+            {"sensor_response_type" : {
+                    "host_id": host_name,
+                    "alert_type": alert_type,
+                    "severity": severity,
+                    "alert_id": alert_id,
+                    "info": info,
+                    "specific_info": specific_info
+                },
+            })
+
+        return json_msg
+
+    def _get_alert_id(self, epoch_time):
+        """Returns alert id which is a combination of
+           epoch_time and salt value
+        """
+        salt = str(uuid.uuid4().hex)
+        alert_id = epoch_time + salt
+        return alert_id
 
     def _execute_request(self, actuator_instance, json_msg, uuid):
         """Calls perform_request method of an actuator and sends response to
